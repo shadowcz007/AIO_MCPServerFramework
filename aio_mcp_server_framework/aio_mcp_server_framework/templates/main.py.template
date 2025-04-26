@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+import sys
+from aio_mcp_server_framework import MCPServerFramework, BaseModuleManager, SERVICE_VERSION
+from typing import Dict, List
+import mcp.types as types
+
+# 自定义模块管理器
+class MyModuleManager(BaseModuleManager):
+    async def initialize(self, **kwargs) -> None:
+        # 在这里初始化您的模块
+        print("模块初始化成功")
+    
+    def get_tools(self) -> List[types.Tool]:
+        # 返回您的工具列表
+        return [
+            types.Tool(
+                name="example_tool",
+                description="这是一个示例工具",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "消息内容"
+                        }
+                    },
+                    "required": ["message"]
+                }
+            )
+        ]
+    
+    async def call_tool(self, name: str, arguments: Dict, ctx=None) -> Dict:
+        # 处理工具调用
+        if name == "example_tool":
+            message = arguments.get("message", "")
+            if ctx:
+                await ctx.info(f"接收到消息: {message}")
+            return {"result": f"您发送的消息是: {message}"}
+        raise ValueError(f"未知工具: {name}")
+
+def main():
+    # 创建框架实例
+    framework = MCPServerFramework(
+        name="{{PROJECT_NAME}}",
+        version=SERVICE_VERSION,
+        description="{{PROJECT_DESCRIPTION}}",
+        author="{{AUTHOR}}",
+        github="{{GITHUB_URL}}",
+        module_parameters={
+            "example_param": {
+                "type": "str",
+                "help": "示例参数",
+                "default": "默认值"
+            }
+        }
+    )
+    
+    # 运行服务器
+    framework.run(
+        create_module_manager_func=lambda **kwargs: MyModuleManager()
+    )
+
+if __name__ == "__main__":
+    main() 

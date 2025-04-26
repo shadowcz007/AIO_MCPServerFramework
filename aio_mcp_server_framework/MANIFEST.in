@@ -1,0 +1,4 @@
+include LICENSE
+include README.md
+include pyproject.toml
+recursive-include aio_mcp_server_framework/templates * 
