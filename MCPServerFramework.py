@@ -14,10 +14,13 @@ from starlette.middleware.cors import CORSMiddleware
 import asyncio
 from mcp.shared.context import RequestContext
 import logging
-
+from anyio import Event
+import signal
+import psutil
+import uvicorn
 
 # 服务版本号
-SERVICE_VERSION = "1.2.2"
+SERVICE_VERSION = "1.3.0"
 
 class ExtendedRequestContext:
     """扩展的请求上下文，增加了日志功能和客户端通知机制"""
@@ -42,7 +45,8 @@ class ExtendedRequestContext:
             logger_name: 日志记录器名称
         """
         # 记录到本地日志
-        logging.getLogger(logger_name).info(message)
+        # logging.getLogger(logger_name).info(message)
+        self.logger.info(message)
         
         # 发送到客户端
         if self._original_ctx and hasattr(self._original_ctx, "session"):
@@ -54,7 +58,7 @@ class ExtendedRequestContext:
                         logger=logger_name
                     )
                 except Exception as e:
-                    logging.error(f"向客户端发送日志消息失败: {e}")
+                    self.logger.error(f"向客户端发送日志消息失败: {e}")
         
     async def error(self, message, logger_name="default"):
         """发送错误日志
@@ -64,7 +68,8 @@ class ExtendedRequestContext:
             logger_name: 日志记录器名称
         """
         # 记录到本地日志
-        logging.getLogger(logger_name).error(message)
+        # logging.getLogger(logger_name).error(message)
+        self.logger.error(message)
         
         # 发送到客户端
         if self._original_ctx and hasattr(self._original_ctx, "session"):
@@ -76,7 +81,7 @@ class ExtendedRequestContext:
                         logger=logger_name
                     )
                 except Exception as e:
-                    logging.error(f"向客户端发送日志消息失败: {e}")
+                    self.logger.error(f"向客户端发送日志消息失败: {e}")
         
     async def warning(self, message, logger_name="default"):
         """发送警告日志
@@ -86,8 +91,9 @@ class ExtendedRequestContext:
             logger_name: 日志记录器名称
         """
         # 记录到本地日志
-        logging.getLogger(logger_name).warning(message)
-        
+        # logging.getLogger(logger_name).warning(message)
+        self.logger.warning(message)
+
         # 发送到客户端
         if self._original_ctx and hasattr(self._original_ctx, "session"):
             if hasattr(self._original_ctx.session, "send_log_message"):
@@ -98,7 +104,7 @@ class ExtendedRequestContext:
                         logger=logger_name
                     )
                 except Exception as e:
-                    logging.error(f"向客户端发送日志消息失败: {e}")
+                    self.logger.error(f"向客户端发送日志消息失败: {e}")
         
     async def debug(self, message, logger_name="default"):
         """发送调试日志
@@ -108,7 +114,8 @@ class ExtendedRequestContext:
             logger_name: 日志记录器名称
         """
         # 记录到本地日志
-        logging.getLogger(logger_name).debug(message)
+        # logging.getLogger(logger_name).debug(message)
+        self.logger.debug(message)
         
         # 发送到客户端
         if self._original_ctx and hasattr(self._original_ctx, "session"):
@@ -132,12 +139,14 @@ class ExtendedRequestContext:
         if self._original_ctx and hasattr(self._original_ctx, "session"):
             # 获取进度令牌
             progress_token = None
+            
             if hasattr(self._original_ctx, "meta") and self._original_ctx.meta:
+                print("#DEBUG# progress_token", self._original_ctx.meta)
                 progress_token = getattr(self._original_ctx.meta, "progressToken", None)
             
             # 如果没有进度令牌，可以使用请求ID作为标识
             if progress_token is None:
-                progress_token = str(self._original_ctx.request_id)
+                return
                 
             # 发送进度通知
             if hasattr(self._original_ctx.session, "send_progress_notification"):
@@ -250,7 +259,7 @@ class MCPServerCore:
         # 添加资源变更通知
         async def notify_resources_changed():
             """通知客户端资源列表已变更"""
-            logger = logging.getLogger(__name__)
+            logger = self.logger
             logger.debug("发送资源变更通知")
             try:
                 await app.request_context.session.send_resource_list_changed()
@@ -278,7 +287,7 @@ class MCPServerCore:
                 # 获取当前请求上下文
                 current_ctx = app.request_context
                 extended_ctx = ExtendedRequestContext(current_ctx)
-
+                extended_ctx.logger = self.logger
                 # 将请求上下文传递给模块的call_tool方法
                 result = await self.module_manager.call_tool(name, arguments, ctx=extended_ctx)
                 return [types.TextContent(
@@ -300,7 +309,7 @@ class MCPServerCore:
                 else:
                     return self.module_manager.get_prompt_templates()
             except Exception as e:
-                logger = logging.getLogger(__name__)
+                logger = self.logger
                 logger.error(f"获取提示模板列表出错: {e}")
                 return []
         
@@ -308,7 +317,7 @@ class MCPServerCore:
         @app.get_prompt()
         async def handle_get_prompt(name: str, arguments: Dict[str, str] | None) -> types.GetPromptResult:
             try:
-                logger = logging.getLogger(__name__)
+                logger = self.logger
                 logger.debug(f"获取提示模板: {name} 参数: {arguments}")
                 
                 # 优先使用外部提供的函数，如果没有则使用模块管理器的方法
@@ -336,14 +345,6 @@ class MCPServerFramework:
                  module_parameters: Dict[str, Dict] = None):
         """
         初始化服务器框架
-        
-        Args:
-            name: 服务名称
-            version: 服务版本
-            description: 服务描述
-            author: 作者信息
-            github: GitHub仓库地址
-            module_parameters: 模块特定参数的配置，格式为 {参数名: {type: 类型, help: 帮助信息, default: 默认值}}
         """
         self.name = name
         self.version = version  
@@ -351,9 +352,95 @@ class MCPServerFramework:
         self.author = author
         self.github = github
         self.module_parameters = module_parameters or {}
+        
+        # 创建 anyio Event 用于内部事件同步
+        self._shutdown_event = Event()
+        
+        # 首先设置日志系统并保存logger实例
+        self.logger = self._setup_logging()
+        
         self.config = self._load_config()
         
-    def _setup_logging(self, log_level=logging.INFO) -> logging.Logger:
+        # 获取父进程ID
+        self.parent_pid = os.getppid()
+        self.logger.info(f"父进程ID: {self.parent_pid}")
+        
+        # 设置信号处理器
+        def handle_shutdown(signum, frame):
+            signal_names = {
+                signal.SIGTERM: "SIGTERM",
+                signal.SIGINT: "SIGINT (Ctrl+C)",
+                signal.SIGBREAK: "SIGBREAK" if hasattr(signal, 'SIGBREAK') else None
+            }
+            signal_name = signal_names.get(signum, str(signum))
+            self.logger.warning(f"收到系统终止信号: {signal_name}")
+            self.logger.info("开始执行优雅退出流程...")
+            # 使用 anyio 的方式设置事件
+            asyncio.create_task(self._trigger_shutdown())
+
+        # 注册所有可能的终止信号
+        signal.signal(signal.SIGTERM, handle_shutdown)
+        signal.signal(signal.SIGINT, handle_shutdown)
+        if hasattr(signal, 'SIGBREAK'):  # Windows specific
+            signal.signal(signal.SIGBREAK, handle_shutdown)
+            
+        # 启动父进程监控任务
+        # asyncio.create_task(self._monitor_parent_process())
+        
+    async def _monitor_parent_process(self):
+        """监控父进程状态"""
+        while True:
+            try:
+                # 检查父进程是否存在
+                if not psutil.pid_exists(self.parent_pid):
+                    self.logger.warning("父进程已终止，开始执行优雅退出...")
+                    await self._trigger_shutdown()
+                    break
+                
+                # 检查父进程状态
+                parent = psutil.Process(self.parent_pid)
+                if parent.status() == psutil.STATUS_ZOMBIE:
+                    self.logger.warning("父进程处于僵尸状态，开始执行优雅退出...")
+                    await self._trigger_shutdown()
+                    break
+                    
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                self.logger.warning("无法访问父进程，开始执行优雅退出...")
+                await self._trigger_shutdown()
+                break
+                
+            except Exception as e:
+                self.logger.error(f"监控父进程时发生错误: {e}")
+                
+            # 每秒检查一次
+            await asyncio.sleep(1)
+
+    async def _trigger_shutdown(self):
+        """触发关闭事件的异步方法"""
+        self._shutdown_event.set()
+        
+        # 获取当前进程ID
+        current_pid = os.getpid()
+        
+        # 在Windows环境下，使用CTRL_BREAK_EVENT
+        if sys.platform == "win32":
+            try:
+                # 发送CTRL_BREAK_EVENT信号
+                os.kill(current_pid, signal.CTRL_BREAK_EVENT)
+            except Exception as e:
+                self.logger.error(f"发送CTRL_BREAK_EVENT失败: {e}")
+                # 如果发送信号失败，直接调用sys.exit
+                sys.exit(1)
+        else:
+            # 在非Windows环境下，使用SIGTERM
+            try:
+                os.kill(current_pid, signal.SIGTERM)
+            except Exception as e:
+                self.logger.error(f"发送SIGTERM失败: {e}")
+                # 如果发送信号失败，直接调用sys.exit
+                sys.exit(1)
+    
+    def _setup_logging(self, log_level=logging.DEBUG) -> logging.Logger:
         """设置日志系统"""
         if getattr(sys, 'frozen', False):
             log_path = Path(sys.executable).parent / "logs"
@@ -366,17 +453,29 @@ class MCPServerFramework:
         # 设置日志文件名（使用当前日期）
         log_file = log_path / f"{self.name}_{datetime.now().strftime('%Y%m%d')}.log"
         
-        # 配置日志
-        logging.basicConfig(
-            level=log_level,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_file, encoding='utf-8'),
-                logging.StreamHandler()
-            ]
-        )
+        # 创建logger实例
+        logger = logging.getLogger(self.name)
+        logger.setLevel(log_level)  # 设置日志级别
         
-        logger = logging.getLogger(__name__)
+        # 创建文件处理器
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        
+        # 创建控制台处理器
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        
+        # 清除可能存在的旧处理器
+        logger.handlers.clear()
+        
+        # 添加处理器
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+        
+        # 防止日志向上传播
+        logger.propagate = False
+        
+        logger.info(f"日志路径: {log_file}")
         return logger
     
     def _load_config(self) -> Dict:
@@ -474,106 +573,154 @@ class MCPServerFramework:
         """运行stdio模式服务器"""
         from mcp.server.stdio import stdio_server
         
-        # 创建模块管理器
-        module_manager = create_module_manager_func(**params)
-        await module_manager.initialize(**params)
+        logger = self.logger
+        logger.info("准备启动 stdio 模式服务器...")
         
-        # 创建服务器核心
-        server_core = MCPServerCore(
-            self.name,
-            self.version,
-            module_manager,
-            instructions=self.description,
-            get_prompt_templates_func=get_prompt_templates_func,
-            get_prompt_content_func=get_prompt_content_func
-        )
-        
-        # 运行stdio服务器
-        async with stdio_server() as (read_stream, write_stream):
-            await server_core.app.run(
-                read_stream,
-                write_stream,
-                server_core.app.create_initialization_options()
+        try:
+            # 创建模块管理器
+            logger.info("正在初始化模块管理器...")
+            module_manager = create_module_manager_func(**params)
+            await module_manager.initialize(**params)
+            logger.info("模块管理器初始化完成")
+            
+            # 创建服务器核心
+            logger.info("正在创建服务器核心...")
+            server_core = MCPServerCore(
+                self.name,
+                self.version,
+                module_manager,
+                instructions=self.description,
+                get_prompt_templates_func=get_prompt_templates_func,
+                get_prompt_content_func=get_prompt_content_func
             )
+            server_core.logger = self.logger
+            logger.info("服务器核心创建完成")
+ 
+
+            async with stdio_server() as (read_stream, write_stream):
+                logger.info("stdio 服务器启动成功")
+                # 启动父进程监控
+                asyncio.create_task(self._monitor_parent_process())
+                await server_core.app.run(
+                    read_stream,
+                    write_stream,
+                    server_core.app.create_initialization_options()
+                )
+                
+        except Exception as e:
+            logger.error(f"服务器启动失败: {e}")
+            raise
+        finally:
+            try:
+                logger.info("服务器正在关闭...")
+                # 确保日志被写入
+                for handler in logger.handlers:
+                    handler.flush()
+                logger.info("服务器已完全关闭")
+                # 再次确保最后的日志被写入
+                for handler in logger.handlers:
+                    handler.flush()
+            except Exception as e:
+                print(f"关闭时发生错误: {e}")
     
     async def _run_sse_server(self, port: int, create_module_manager_func, params,
                              get_prompt_templates_func=None, get_prompt_content_func=None):
         """运行SSE模式服务器"""
         from mcp.server.sse import SseServerTransport
         
-        # 创建模块管理器
-        module_manager = create_module_manager_func(**params)
-        await module_manager.initialize(**params)
+        logger = self.logger
+        logger.info(f"准备启动 SSE 模式服务器，端口: {port}")
         
-        # 创建服务器核心
-        server_core = MCPServerCore(
-            self.name,
-            self.version,
-            module_manager,
-            instructions=self.description,
-            get_prompt_templates_func=get_prompt_templates_func,
-            get_prompt_content_func=get_prompt_content_func
-        )
-        
-        # 设置 SSE 服务器
-        sse = SseServerTransport("/messages/")
-        
-        # 定义SSE处理函数
-        async def handle_sse(request):
-            async with sse.connect_sse(
-                request.scope, request.receive, request._send
-            ) as streams:
-                await server_core.app.run(
-                    streams[0], streams[1], server_core.app.create_initialization_options()
-                )
-                
-        # 添加 CORS 中间件配置        
-        middleware = [
-            Middleware(
-                CORSMiddleware,
-                allow_origins=["*"],
-                allow_credentials=True,
-                allow_methods=["*"],
-                allow_headers=["*"],
+        try:
+            # 创建模块管理器
+            logger.info("正在初始化模块管理器...")
+            module_manager = create_module_manager_func(**params)
+            await module_manager.initialize(**params)
+            logger.info("模块管理器初始化完成")
+            
+            # 创建服务器核心
+            logger.info("正在创建服务器核心...")
+            server_core = MCPServerCore(
+                self.name,
+                self.version,
+                module_manager,
+                instructions=self.description,
+                get_prompt_templates_func=get_prompt_templates_func,
+                get_prompt_content_func=get_prompt_content_func
             )
-        ]
+            server_core.logger = self.logger
+            logger.info("服务器核心创建完成")
+            
+            # 设置 SSE 服务器
+            sse = SseServerTransport("/messages/")
+            
+            # 定义SSE处理函数
+            async def handle_sse(request):
+                logger.debug(f"新的 SSE 连接: {request.client}")
+                try:
+                    async with sse.connect_sse(
+                        request.scope, request.receive, request._send
+                    ) as streams:
+                        await server_core.app.run(
+                            streams[0], streams[1], server_core.app.create_initialization_options()
+                        )
+                except Exception as e:
+                    logger.error(f"SSE 连接处理错误: {e}")
+                    raise
+                finally:
+                    logger.debug(f"SSE 连接关闭: {request.client}")
                 
-        # 创建Starlette应用
-        starlette_app = Starlette(
-            debug=True,
-            routes=[
-                Route("/", endpoint=handle_sse),
-                Mount("/messages/", app=sse.handle_post_message),
-            ],
-            middleware=middleware
-        )
+            # 创建Starlette应用
+            starlette_app = Starlette(
+                debug=True,
+                routes=[
+                    Route("/", endpoint=handle_sse),
+                    Mount("/messages/", app=sse.handle_post_message),
+                ],
+                middleware=[
+                    Middleware(
+                        CORSMiddleware,
+                        allow_origins=["*"],
+                        allow_credentials=True,
+                        allow_methods=["*"],
+                        allow_headers=["*"],
+                    )
+                ]
+            )
 
-        # 启动服务器
-        import uvicorn
-        import socket
+            @starlette_app.on_event("startup")
+            async def startup_event():
+                logger.info("Web 服务器启动完成")
 
-        def get_local_ip():
+            @starlette_app.on_event("shutdown")
+            async def shutdown_event():
+                logger.info("Web 服务器开始关闭")
+                # 这里可以添加额外的清理代码
+                logger.info("Web 服务器清理完成")
+
+            # 启动服务器
+            config = uvicorn.Config(
+                starlette_app, 
+                host="0.0.0.0", 
+                port=port,
+                log_level="warning"
+            )
+            server = uvicorn.Server(config)
+            
             try:
-                hostname = socket.gethostname()
-                ip = socket.gethostbyname(hostname)
-                return ip
-            except:
-                return "127.0.0.1"
-
-        local_ip = get_local_ip()
-        print(f"\n🚀 服务器启动成功!")
-        print(f"📡 本地访问地址: http://127.0.0.1:{port}")
-        print(f"📡 局域网访问地址: http://{local_ip}:{port}")
-        print("\n按 CTRL+C 停止服务器\n")
-
-        config = uvicorn.Config(
-            starlette_app, 
-            host="0.0.0.0", 
-            port=port,
-            log_level="warning"
-        )
-        server = uvicorn.Server(config)
-        await server.serve()
+                logger.info("开始运行 Web 服务器...")
+                await server.serve()
+            except Exception as e:
+                logger.error(f"Web 服务器运行错误: {e}")
+                raise
+            finally:
+                logger.info("Web 服务器已关闭")
+                
+        except Exception as e:
+            logger.error(f"SSE 服务器启动失败: {e}")
+            raise
+        finally:
+            logger.info("SSE 服务器完全关闭")
     
     def run(self, create_module_manager_func: Callable, 
             get_prompt_templates_func=None, get_prompt_content_func=None):
@@ -591,6 +738,12 @@ class MCPServerFramework:
         parser = argparse.ArgumentParser(description=self.description)
         parser.add_argument('--port', type=int, help='服务器端口号 (仅在 transport=sse 时需要)')
         parser.add_argument('--transport', type=str, choices=['stdio', 'sse'], default='sse', help='传输类型 (stdio 或 sse)')
+        # 添加日志级别参数
+        parser.add_argument('--log-level', 
+                           type=str, 
+                           choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                           default='INFO',
+                           help='日志级别')
         
         # 添加模块特定的参数
         for param_name, param_config in self.module_parameters.items():
@@ -601,6 +754,10 @@ class MCPServerFramework:
             )
         
         args = parser.parse_args()
+        
+        # 设置日志级别
+        log_level = getattr(logging, args.log_level)
+        self.logger.setLevel(log_level)
         
         # 处理stdio模式
         if args.transport == 'stdio':
@@ -738,3 +895,7 @@ class MCPServerFramework:
                 get_prompt_templates_func, 
                 get_prompt_content_func
             ))
+
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
